@@ -1,0 +1,280 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <Firebase_ESP_Client.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Servo.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+
+Servo s1; 
+const int pinBuzzer = D3;
+
+// DS18B20 is connected to
+const int oneWireBus = D2;     
+OneWire oneWire(oneWireBus);
+DallasTemperature sensors(&oneWire);
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+const char *ssid = "Homebast"; 
+const char *password = "Rumahkita12"; 
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP,"id.pool.ntp.org");
+
+// Untuk konek ke server firebase
+#define API_KEY "AIzaSyClTb4NjK1qilelOuKwS8k7hZZOUY5BxwM"
+#define DATABASE_URL "test2-2b9be-default-rtdb.asia-southeast1.firebasedatabase.app"
+const char* serverName = "http://192.168.1.7/projectta/api/sensorpost";
+const char* endPointPemberianPakan = "http://192.168.1.7/projectta/api/waktu-pemberian-pakan";
+
+FirebaseData fbdo;
+FirebaseAuth auth; 
+FirebaseConfig config;
+
+long duration;
+float status;
+float statusPH;
+
+unsigned long sendDataPrevMillis = 0;
+bool signupOK = false;
+
+unsigned long previousMillis = 0; // Variable to store the last time the HTTP POST request was made
+
+const unsigned long interval = 1000; // 5 menit
+const unsigned long openDuration = 5000; // Durasi membuka servo dalam milidetik (5 detik)
+const unsigned long closeDuration = 5000;
+
+unsigned long convertToMillis(int hours, int minutes) {
+  return hours * 60 * 60 * 1000 + minutes * 60 * 1000;
+}
+
+unsigned long sendDataDatabasePrevMillis = 0;
+unsigned long sendDataFirebasePrevMillis = 0;
+const unsigned long sendDataDatabaseInterval = 300000; // 2 menit
+const unsigned long sendDataFirebaseInterval = 3000; 
+
+
+std::vector<std::vector<int>> open_times;
+
+int num_open_times = 0;
+
+bool servoOpened = false; // Flag untuk menandakan apakah servo sudah dibuka
+signed long servoOpenTime = 0;
+bool isServoOpen = false;
+
+void setup(){
+  Serial.begin(9600);
+  // Sambungkan ke jaringan Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected with IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println();
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  pinMode(pinBuzzer, OUTPUT);
+
+  /* Sign up */
+  if (Firebase.signUp(&config, &auth, "", "")){
+    Serial.println("ok");
+    signupOK = true;
+  }
+  else{
+    Serial.printf("%s\n", config.signer.signupError.message.c_str());
+  }
+
+  /* Assign the callback function for the long running token generation task */
+  config.token_status_callback = tokenStatusCallback; //see addons/TokenHelper.h
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  sensors.begin();
+  timeClient.begin();
+  timeClient.setTimeOffset( 7 * 3600);
+
+  // pinMode(3,OUTPUT);
+
+  s1.attach(D1);
+  s1.write(0); // Pastikan servo dalam posisi tertutup saat awalnya
+
+  getTime();
+  delay(1000);
+}
+
+void getTime() {
+    WiFiClient client;
+    HTTPClient http; 
+
+    http.begin(client, endPointPemberianPakan);
+
+    int httpResponseCode = http.GET();
+
+    if(httpResponseCode == 200) {
+      String payload = http.getString();
+
+      DynamicJsonDocument doc(1024);
+      deserializeJson(doc, payload);
+
+      JsonArray data = doc["data"];
+
+      int dataSize = data.size();
+      // Serial.print("Data Size : ");
+      // Serial.println(dataSize);
+      // Serial.println(payload);
+
+      open_times.clear();
+
+      for(int i = 0; i < dataSize; i++) {
+        String timeStr = data[i].as<String>();
+        int hour = timeStr.substring(0,2).toInt();
+        int minute = timeStr.substring(3,5).toInt();
+
+        open_times.push_back({hour, minute});
+      }
+    }
+      // Serial.print("Open Size : ");
+      // Serial.println(open_times.size());
+    http.end();
+}
+
+void controlServo(int currentHour, int currentMinute) {
+  // Serial.print("Open Size : ");
+  // Serial.println(open_times.size());
+  if (!servoOpened) { // Jika servo belum dibuka
+    for (int i = 0; i < open_times.size(); i++) {
+      int openHour = open_times[i][0];
+      int openMinute = open_times[i][1];
+
+      // Serial.print("Current hour: ");
+      // Serial.print(currentHour);
+      // Serial.print(":");
+      // Serial.println(currentMinute);
+      // Serial.print("Open hour: ");
+      // Serial.print(openHour);
+      // Serial.print(":");
+      // Serial.println(openMinute);
+
+      if (currentHour == openHour && currentMinute == openMinute) {
+        s1.write(180); // Buka servo
+        Serial.println("Servo Terbuka");
+        delay(openDuration);
+        Serial.println("Servo Tertutup");
+        s1.write(0); // Tutup servo
+        servoOpened = true; // Set flag bahwa servo telah dibuka
+        break; // Keluar dari loop setelah servo terbuka pada waktu yang diinginkan
+      }
+    }
+  }
+}
+
+void sendDataToDatabase(float suhu, float ph, String status, String statusPH) {
+  WiFiClient client;
+  HTTPClient http; 
+
+  http.begin(client, serverName);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+  String httpRequestData = "value1=" + String(suhu) + "&value2=" + String(ph) + "&value3=" + String(status) + "&value4=" + String(statusPH);
+  int httpResponseCode = http.POST(httpRequestData);
+  
+  if (httpResponseCode > 0) {
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
+  http.end();
+  // delay(60000);
+}
+
+void loop() {
+  timeClient.update();
+  Serial.println(timeClient.getFormattedTime());
+  unsigned long currentMillis = millis(); 
+  
+  int currentHour = timeClient.getHours();
+  int currentMinute = timeClient.getMinutes();
+
+  if(currentHour == 0 && currentMinute == 0) {
+    getTime();
+  }
+
+  sensors.requestTemperatures();
+  float suhu = sensors.getTempCByIndex(0);
+  float ph = random(6.0, 10.0);
+  String status;
+  String statusPH;
+
+    if (suhu >= 30) {
+    status = "Suhu Sangat Panas";
+    tone(pinBuzzer, 494, 500); // Frekuensi 494 Hz selama 500 ms (nada B4)
+    delay(400);
+    } else if (suhu <= 24) {
+      status = "Suhu Terlalu Dingin";
+      // digitalWrite(pinBuzzer, HIGH);
+      tone(pinBuzzer, 494, 500); // Frekuensi 494 Hz selama 500 ms (nada B4)
+      delay(400);
+      } else {
+        status = "Suhu Normal";
+        // s1.write(0);
+        // digitalWrite(pinBuzzer, LOW);
+        noTone(pinBuzzer);         // Menghentikan bunyi buzzer
+        // delay(60000);          // Menghentikan bunyi buzzer 
+      }
+
+  // Set the value for statusPH based on ph
+    if (ph >= 9) {
+      statusPH = "Basa";
+      // tone(pinBuzzer, 494, 500); // Frekuensi 494 Hz selama 500 ms (nada B4)
+      // delay(600);
+    } else if (ph <= 6) {
+      statusPH = "Asam";
+      // tone(pinBuzzer, 494, 500); // Frekuensi 494 Hz selama 500 ms (nada B4)
+      // delay(600);
+    } else {
+      statusPH = "Normal";
+      // noTone(pinBuzzer);         // Menghentikan bunyi buzzer
+      // delay(60000);  
+    }
+
+    // Set the value for status based on suhu
+
+    if (WiFi.status() == WL_CONNECTED) {
+        controlServo(currentHour, currentMinute);
+
+        if (Firebase.ready() && signupOK && (currentMillis - sendDataFirebasePrevMillis > sendDataFirebaseInterval || sendDataFirebasePrevMillis == 0)) {
+            sendDataFirebasePrevMillis = currentMillis;
+            if (Firebase.RTDB.setFloat(&fbdo, "Sensor/suhu", suhu) && Firebase.RTDB.setFloat(&fbdo, "Sensor/ph", ph)) {
+                Serial.print("Suhu: ");
+                Serial.println(suhu);
+                Serial.print("Ph: ");
+                Serial.println(ph);
+            } else {
+                Serial.println("GAGAL MENYIMPAN DATA");
+                Serial.println("ERROR: " + fbdo.errorReason());
+            }
+        }
+
+        if (currentMillis - sendDataDatabasePrevMillis > sendDataDatabaseInterval || sendDataDatabasePrevMillis == 0) {
+            sendDataDatabasePrevMillis = currentMillis;
+            sendDataToDatabase(suhu, ph, status, statusPH);
+        }
+        delay(1000); // Tambahkan penundaan agar tidak terlalu cepat dalam looping
+    }
+
+    Serial.flush();
+}
